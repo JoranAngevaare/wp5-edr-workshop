@@ -107,9 +107,10 @@ def get_data(station_wsi: str, variable: str) -> list[tuple[datetime, float | No
 def get_variables_for_station(station_id: str):
     vars = get_variables()
     vars_with_data = []
+    ds_station = ds.sel(station=wsi_station_id_mapping[station_id]).load()
     for var in vars:
-        var_data = ds.sel(station=wsi_station_id_mapping[station_id])[var.id]
-        if not np.isnan(var_data.values).all():
+        var_data = ds_station[var.id]
+        if not np.any(~np.isnan(var_data.values)):
             vars_with_data.append(var)
     return vars_with_data
 
