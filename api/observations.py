@@ -2,38 +2,24 @@ from __future__ import annotations
 
 import logging
 from typing import Annotated
+import pydantic_core
+from covjson_pydantic.coverage import CoverageCollection, Coverage, TiledNdArrayFloat
+from covjson_pydantic.ndarray import TileSet, NdArrayFloat
+from covjson_pydantic.domain import Domain, Axes, ValuesAxis, DomainType
+from covjson_pydantic.parameter import Parameter, ObservedProperty, Unit
 
-from covjson_pydantic.coverage import Coverage
-from covjson_pydantic.coverage import CoverageCollection
-from covjson_pydantic.domain import Axes
-from covjson_pydantic.domain import Domain
-from covjson_pydantic.domain import DomainType
-from covjson_pydantic.domain import ValuesAxis
-from covjson_pydantic.ndarray import NdArrayFloat
-from covjson_pydantic.parameter import Parameter
 from edr_pydantic.parameter import EdrBaseModel
 from fastapi import APIRouter
-from fastapi import HTTPException
 from fastapi import Path
 from fastapi import Query
-from geojson_pydantic import Feature
 from geojson_pydantic import FeatureCollection
-from geojson_pydantic import Point
-from pydantic import AwareDatetime
-from shapely import geometry
-from shapely import wkt
 from starlette.responses import JSONResponse
-
-from api.util import get_covjson_parameter_from_variable
-from api.util import get_reference_system
-from api.util import split_raw_interval_into_start_end_datetime
-from api.util import split_string_parameters_to_list
+import sys
+from fastapi import HTTPException
 from data import data
-from data.data import get_data
-from data.data import get_station
-from data.data import get_stations
-from data.data import get_variables
-from data.data import get_variables_for_station
+from .util import get_reference_system, split_raw_interval_into_start_end_datetime
+import numpy as np
+
 
 router = APIRouter(prefix="/collections/observations")
 
@@ -51,14 +37,6 @@ class GeoJsonResponse(JSONResponse):
 
 class EDRFeatureCollection(EdrBaseModel, FeatureCollection):
     parameters: dict[str, Parameter]
-
-
-def check_requested_parameters_exist(requested_parameters, all_parameters):
-    if not set(requested_parameters).issubset(set(all_parameters)):
-        unavailable_parameters = set(requested_parameters) - set(all_parameters)
-        raise HTTPException(
-            status_code=400, detail=f"The following parameters are not available: {unavailable_parameters}"
-        )
 
 
 @router.get(
@@ -81,97 +59,7 @@ async def get_locations(
         ),
     ] = None,
 ) -> EDRFeatureCollection:
-    stations = data.get_stations()
-
-    # Handle bounding box
-    if bbox:
-        bbox_values = list(map(lambda x: float(str.strip(x)), bbox.split(",")))
-        if len(bbox_values) != 4:
-            raise HTTPException(status_code=400, detail="If provided, the bbox should have 4 values")
-        left, bottom, right, top = bbox_values
-        stations = list(filter(lambda s: left <= s.longitude <= right and bottom <= s.latitude <= top, stations))
-
-    # Handle parameters
-    all_parameters: dict[str, Parameter] = {var.id: get_covjson_parameter_from_variable(var) for var in get_variables()}
-    requested_parameters = None
-    if parameter_name:
-        requested_parameters = set(map(lambda x: str.strip(x), parameter_name.split(",")))
-        check_requested_parameters_exist(requested_parameters, all_parameters.keys())
-
-    # Build list of GeoJSON features
-    features = []
-    parameter_ids_returned_stations = set()
-    for station in stations:
-        variables_for_station = get_variables_for_station(station.wsi)
-        parameter_names_for_station = list(map(lambda x: x.id, variables_for_station))
-
-        # Filter out stations that have none of the requested parameters
-        if requested_parameters and not requested_parameters.intersection(parameter_names_for_station):
-            continue
-
-        features.append(
-            Feature(
-                type="Feature",
-                id=station.wsi,
-                properties={
-                    "name": station.name,
-                    "detail": f"https://oscar.wmo.int/surface/rest/api/search/station?wigosId={station.wsi}",
-                    "parameter-name": sorted(parameter_names_for_station),
-                },
-                geometry=Point(
-                    type="Point",
-                    coordinates=(station.longitude, station.latitude),
-                ),
-            )
-        )
-        parameter_ids_returned_stations.update(parameter_names_for_station)
-
-    parameters_returned_stations = {key: all_parameters[key] for key in sorted(parameter_ids_returned_stations)}
-    return EDRFeatureCollection(type="FeatureCollection", features=features, parameters=parameters_returned_stations)
-
-
-def get_coverage_for_station(station, parameters, start_datetime, end_datetime) -> Coverage:
-    # See if we have any data in this time interval by testing the first parameter
-    # TODO: Making assumption here the time interval is the same for all parameters
-    data = get_data(station.wsi, list(parameters)[0])
-    t_axis_values = [t for t, v in data if (start_datetime <= t <= end_datetime)]
-    if len(t_axis_values) == 0:
-        raise HTTPException(status_code=400, detail="No data available")
-
-    # Get parameter data
-    ranges = {}
-    for p in parameters:
-        values = []
-        for time, value in get_data(station.wsi, p):
-            if start_datetime <= time <= end_datetime:
-                values.append(value)
-
-        ranges[p] = NdArrayFloat(
-            axisNames=["t", "y", "x"],
-            shape=[len(values), 1, 1],
-            values=values,
-        )
-
-    # Add station code
-    station_code = {"eumetnet:locationId": station.wsi}
-
-    domain = Domain(
-        domainType=DomainType.point_series,
-        axes=Axes(
-            x=ValuesAxis[float](values=[station.longitude]),
-            y=ValuesAxis[float](values=[station.latitude]),
-            t=ValuesAxis[AwareDatetime](values=t_axis_values),
-        ),
-    )
-
-    return Coverage(domain=domain, ranges=ranges, **station_code)
-
-
-def handle_datetime(datetime):
-    start_datetime, end_datetime = split_raw_interval_into_start_end_datetime(datetime)
-    if end_datetime < start_datetime:
-        raise HTTPException(status_code=400, detail="The start datetime must be before end datetime")
-    return start_datetime, end_datetime
+    pass
 
 
 @router.get(
@@ -185,30 +73,98 @@ async def get_data_location_id(
     location_id: Annotated[str, Path(example="0-20000-0-06260")],
     parameter_name: Annotated[
         str | None,
-        Query(alias="parameter-name", description="Comma seperated list of parameter names.", example="ff, dd"),
+        Query(
+            alias="parameter-name",
+            description="Comma separated list of parameter names.",
+            example="ff, dd",
+        ),
     ] = None,
-    datetime: Annotated[str | None, Query(example="2024-02-22T01:00:00Z/2024-02-22T02:00:00Z")] = None,
+    datetime: Annotated[
+        str | None, Query(example="2024-02-22T01:00:00Z/2024-02-22T02:00:00Z")
+    ] = None,
 ) -> CoverageCollection:
-    # Location query parameter
-    station = get_station(location_id)
-    if not station:
-        raise HTTPException(status_code=404, detail="Location not found")
 
-    start_datetime, end_datetime = handle_datetime(datetime)
-
-    # Parameter_name query parameter
-    parameters: dict[str, Parameter] = {
-        var.id: get_covjson_parameter_from_variable(var) for var in get_variables_for_station(location_id)
+    if location_id not in [s.wsi for s in data.get_stations()]:
+        raise HTTPException(
+            status_code=400, detail=f"{location_id} is not in {data.get_stations()}"
+        )
+    station = data.get_station(location_id)
+    variables = (
+        data.get_variables_for_station(location_id)
+        if parameter_name is None
+        else [data.get_variable(x) for x in parameter_name.replace(" ", "").split(",")]
+    )
+    variables = [v for v in variables if v is not None]
+    if not variables:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only unknown parameters {parameter_name} for {location_id}",
+        )
+    variables_str = list(map(lambda x: x.id, variables))
+    var_dict = dict(zip(variables_str, variables))
+    if datetime is None:
+        datetime = "1900-01-01T00:00:00Z/2100-02-22T02:00:00Z"
+    try:
+        time_start, time_end = split_raw_interval_into_start_end_datetime(datetime)
+    except pydantic_core.ValidationError as e:
+        raise HTTPException(
+            status_code=400, detail=f"One or more invalid date values: {datetime}"
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"General exception parsing {datetime}"
+        ) from e
+    data_dict = {
+        v: data.get_data_within_time(location_id, v, start=time_start, stop=time_end)
+        for v in variables_str
     }
+    if all(len(v) == 0 for v in data_dict.values()):
+        raise HTTPException(
+            status_code=400, detail="No data in range for any variable in time range"
+        )
 
-    if parameter_name:
-        requested_parameters = split_string_parameters_to_list(parameter_name)
-        check_requested_parameters_exist(requested_parameters, parameters.keys())
+    coverages = []
+    for var, data_for_var in data_dict.items():
 
-        parameters = {p: parameters[p] for p in sorted(requested_parameters, key=str.casefold)}
+        dates = [x[0] for x in data_for_var]
+        values = [float(x[1]) for x in data_for_var]
+        coverages += [
+            Coverage(
+                domain=Domain(
+                    domainType=DomainType.point_series,
+                    referencing=get_reference_system(),
+                    axes=Axes(
+                        x=ValuesAxis(values=[station.longitude]),
+                        y=ValuesAxis(values=[station.latitude]),
+                        z=ValuesAxis(values=[station.height]),
+                        t=ValuesAxis(values=dates),
+                    ),
+                ),
+                ranges={
+                    var: NdArrayFloat(
+                        values=values,
+                        type="NdArray",
+                        dataType="float",
+                        shape=[len(values), 1, 1],
+                        axisNames="t x y".split(),
+                    )
+                },
+                parameters={
+                    var: Parameter(
+                        id=var,
+                        label={"en": var_dict[var].standard_name},
+                        description={"en": var_dict[var].long_name},
+                        observedProperty=ObservedProperty(
+                            id=var,
+                            label={"en": var_dict[var].standard_name},
+                        ),
+                        unit=Unit(id=var, label=dict(en=var_dict[var].units)),
+                    )
+                },
+            )
+        ]
 
-    coverage = get_coverage_for_station(station, parameters, start_datetime, end_datetime)
-    return CoverageCollection(coverages=[coverage], parameters=parameters, referencing=get_reference_system())
+    return CoverageCollection(coverages=coverages)
 
 
 @router.get(
@@ -219,55 +175,19 @@ async def get_data_location_id(
     response_class=CoverageJsonResponse,
 )
 async def get_data_area(
-    coords: Annotated[str, Query(example="POLYGON((5.0 52.0, 6.0 52.0,6.0 52.1,5.0 52.1, 5.0 52.0))")],
+    coords: Annotated[
+        str, Query(example="POLYGON((5.0 52.0, 6.0 52.0,6.0 52.1,5.0 52.1, 5.0 52.0))")
+    ],
     parameter_name: Annotated[
         str | None,
-        Query(alias="parameter-name", description="Comma seperated list of parameter names.", example="ff, dd"),
+        Query(
+            alias="parameter-name",
+            description="Comma seperated list of parameter names.",
+            example="ff, dd",
+        ),
     ] = None,
-    datetime: Annotated[str | None, Query(example="2024-02-22T01:00:00Z/2024-02-22T02:00:00Z")] = None,
+    datetime: Annotated[
+        str | None, Query(example="2024-02-22T01:00:00Z/2024-02-22T02:00:00Z")
+    ] = None,
 ) -> CoverageCollection:
-    # No error handling!
-    poly = wkt.loads(coords)
-    stations_in_polygon = [s for s in get_stations() if geometry.Point(s.longitude, s.latitude).within(poly)]
-    if not stations_in_polygon:
-        raise HTTPException(status_code=400, detail="No stations in polygon")
-
-    start_datetime, end_datetime = handle_datetime(datetime)
-
-    # Check that the parameters requested exist in the store
-    # NOTE: How do we define that a parameter exist? In all stations? In a specific station?
-    # In the stations in the polygon?
-    if parameter_name:
-        all_parameter_ids = [var.id for var in get_variables()]
-        requested_parameters = split_string_parameters_to_list(parameter_name)
-        check_requested_parameters_exist(requested_parameters, all_parameter_ids)
-
-    coverages = []
-    collection_parameters: dict[str, Parameter] = {}
-    for station in stations_in_polygon:
-        # Make sure we only return data for parameters that exist for each station
-        parameters: dict[str, Parameter] = {
-            var.id: get_covjson_parameter_from_variable(var) for var in get_variables_for_station(station.wsi)
-        }
-        if parameter_name:
-            parameters = {p: parameters[p] for p in set(requested_parameters).intersection(set(parameters.keys()))}
-
-        if parameters:  # Anything left?
-            coverages.append(
-                get_coverage_for_station(
-                    station,
-                    dict(sorted(parameters.items(), key=lambda i: i[0].casefold())),
-                    start_datetime,
-                    end_datetime,
-                )
-            )
-            collection_parameters.update(parameters)
-
-    if len(coverages) == 0:
-        raise HTTPException(status_code=400, detail="No data available for this query")
-    else:
-        return CoverageCollection(
-            coverages=coverages,
-            parameters=dict(sorted(collection_parameters.items(), key=lambda i: i[0].casefold())),
-            referencing=get_reference_system(),
-        )
+    pass
